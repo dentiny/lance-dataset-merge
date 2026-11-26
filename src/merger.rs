@@ -9,7 +9,7 @@ use lance::dataset::{
 use lance::index::DatasetIndexExt;
 use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::{Error, Result};
-use lance_table::feature_flags::{ensure_can_read_manifest, ensure_can_write_manifest};
+use lance_table::feature_flags::ensure_can_read_manifest;
 use lance_table::format::BasePath;
 
 /// Merges borrowed Lance dataset snapshots without rewriting their data files.
@@ -85,7 +85,6 @@ impl<'a> Merger<'a> {
         for source in sources {
             let manifest = &source.manifest;
             ensure_can_read_manifest(manifest)?;
-            ensure_can_write_manifest(manifest)?;
             source
                 .schema()
                 .check_compatible(first.schema(), &comparison)?;
