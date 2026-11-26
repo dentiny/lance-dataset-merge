@@ -84,7 +84,10 @@ async fn merges_multiple_fragments_without_writing_data_files() {
     );
     let before = (files(&left_path), files(&right_path));
     let target = temp.path().join("merged.lance");
-    let result = Merger::new(&[left, right]).merge(&target).await.unwrap();
+    let result = Merger::new(&[left, right])
+        .merge(target.to_str().unwrap())
+        .await
+        .unwrap();
     assert_eq!(
         values(&result).await,
         vec![Some(1), None, Some(2), Some(2), Some(3), Some(4)]
@@ -126,7 +129,7 @@ async fn empty_sources_before_and_after_nonempty_source() {
         ("last", vec![data.clone(), empty.clone()]),
     ] {
         let merged = Merger::new(&sources)
-            .merge(temp.path().join(name))
+            .merge(temp.path().join(name).to_str().unwrap())
             .await
             .unwrap();
         assert_eq!(values(&merged).await, vec![Some(7)]);
@@ -139,7 +142,7 @@ async fn all_empty_sources_produce_readable_empty_dataset() {
     let empty = write(&temp.path().join("empty.lance"), vec![]).await;
     let target = temp.path().join("merged.lance");
     Merger::new(&[empty.clone(), empty])
-        .merge(&target)
+        .merge(target.to_str().unwrap())
         .await
         .unwrap();
     let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
@@ -154,7 +157,11 @@ async fn all_empty_sources_produce_readable_empty_dataset() {
 async fn no_sources_is_an_error_without_output() {
     let temp = TempDir::new().unwrap();
     let target = temp.path().join("merged.lance");
-    let error = Merger::new(&[]).merge(&target).await.err().unwrap();
+    let error = Merger::new(&[])
+        .merge(target.to_str().unwrap())
+        .await
+        .err()
+        .unwrap();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
     assert!(error.to_string().contains("At least one source"));
     assert!(!target.exists());
@@ -165,12 +172,12 @@ async fn single_and_repeated_source_keep_all_rows() {
     let temp = TempDir::new().unwrap();
     let source = write(&temp.path().join("source.lance"), vec![Some(5), None]).await;
     let single = Merger::new(std::slice::from_ref(&source))
-        .merge(temp.path().join("single"))
+        .merge(temp.path().join("single").to_str().unwrap())
         .await
         .unwrap();
     assert_eq!(values(&single).await, vec![Some(5), None]);
     let repeated = Merger::new(&[source.clone(), source])
-        .merge(temp.path().join("repeated"))
+        .merge(temp.path().join("repeated").to_str().unwrap())
         .await
         .unwrap();
     assert_eq!(values(&repeated).await, vec![Some(5), None, Some(5), None]);
@@ -185,7 +192,7 @@ async fn existing_destination_is_unchanged() {
     write(&target, vec![Some(99)]).await;
     let before = files(&target);
     let error = Merger::new(std::slice::from_ref(&source))
-        .merge(&target)
+        .merge(target.to_str().unwrap())
         .await
         .err()
         .unwrap();
@@ -194,7 +201,12 @@ async fn existing_destination_is_unchanged() {
     assert_eq!(before, files(&target));
     // The source itself is also an existing destination, even through a path alias.
     let alias = temp.path().join("target/../source");
-    assert!(Merger::new(&[source]).merge(&alias).await.is_err());
+    assert!(
+        Merger::new(&[source])
+            .merge(alias.to_str().unwrap())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -219,7 +231,7 @@ async fn schema_mismatch_including_an_empty_source_writes_nothing() {
     .unwrap();
     let target = temp.path().join("merged");
     let error = Merger::new(&[source, other])
-        .merge(&target)
+        .merge(target.to_str().unwrap())
         .await
         .err()
         .unwrap();
@@ -242,7 +254,7 @@ async fn deletions_are_rejected_before_writing() {
     );
     let target = temp.path().join("merged");
     let error = Merger::new(&[source, deleted])
-        .merge(&target)
+        .merge(target.to_str().unwrap())
         .await
         .err()
         .unwrap();
@@ -269,7 +281,11 @@ async fn stable_row_ids_are_rejected_even_for_empty_datasets() {
     .await
     .unwrap();
     let target = temp.path().join("merged");
-    let error = Merger::new(&[source]).merge(&target).await.err().unwrap();
+    let error = Merger::new(&[source])
+        .merge(target.to_str().unwrap())
+        .await
+        .err()
+        .unwrap();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
     assert!(error.to_string().contains("Stable row IDs"));
     assert!(!target.exists());
@@ -295,7 +311,7 @@ async fn uses_the_open_snapshot_after_source_append() {
     assert!(latest.version_id() > snapshot.version_id());
     let before = files(&source_path);
     let result = Merger::new(&[snapshot])
-        .merge(temp.path().join("merged"))
+        .merge(temp.path().join("merged").to_str().unwrap())
         .await
         .unwrap();
     assert_eq!(values(&result).await, vec![Some(1)]);
@@ -330,7 +346,7 @@ async fn shallow_clones_remap_colliding_base_ids() {
     );
     let target = temp.path().join("merged");
     Merger::new(&[clone_left, clone_right])
-        .merge(&target)
+        .merge(target.to_str().unwrap())
         .await
         .unwrap();
     let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
@@ -348,9 +364,58 @@ async fn concurrent_creators_never_overwrite_each_other() {
     let sources = [write(&temp.path().join("source"), vec![Some(1), Some(2)]).await];
     let target = temp.path().join("merged");
     let merger = Merger::new(&sources);
-    let (a, b) = tokio::join!(merger.merge(&target), merger.merge(&target));
+    let (a, b) = tokio::join!(
+        merger.merge(target.to_str().unwrap()),
+        merger.merge(target.to_str().unwrap())
+    );
     assert_ne!(a.is_ok(), b.is_ok());
     let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
     assert_eq!(reopened.version_id(), 1);
     assert_eq!(values(&reopened).await, vec![Some(1), Some(2)]);
+}
+
+#[tokio::test]
+async fn merges_object_store_uris_without_filesystem_resolution() {
+    let session = Arc::new(lance::session::Session::default());
+    let mut sources = Vec::new();
+    for (uri, data) in [
+        ("memory://merge/empty", vec![]),
+        ("memory://merge/left", vec![Some(1), None]),
+        ("memory://merge/right", vec![Some(2)]),
+    ] {
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(data))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let source = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                session: Some(session.clone()),
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        sources.push(source);
+    }
+    let merger = Merger::new(&sources);
+    let target = "memory://merge/output";
+    let merged = merger.merge(target).await.unwrap();
+    assert_eq!(values(&merged).await, vec![Some(1), None, Some(2)]);
+    assert!(
+        merged
+            .manifest
+            .base_paths
+            .values()
+            .all(|base| sources.iter().any(|source| base.path == source.uri()))
+    );
+    let reopened = lance::dataset::builder::DatasetBuilder::from_uri(target)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(values(&reopened).await, vec![Some(1), None, Some(2)]);
+    let error = merger.merge(target).await.err().unwrap();
+    assert!(error.to_string().contains("Destination already exists"));
+    assert_eq!(reopened.version_id(), 1);
 }
