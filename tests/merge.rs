@@ -6,7 +6,7 @@ use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::WriteParams;
-use lance_dataset_merge::merge;
+use lance_dataset_merge::Merger;
 use tempfile::TempDir;
 
 fn schema() -> Arc<Schema> {
@@ -84,7 +84,7 @@ async fn merges_multiple_fragments_without_writing_data_files() {
     );
     let before = (files(&left_path), files(&right_path));
     let target = temp.path().join("merged.lance");
-    let result = merge(&[left, right], &target).await.unwrap();
+    let result = Merger::new(&[left, right]).merge(&target).await.unwrap();
     assert_eq!(
         values(&result).await,
         vec![Some(1), None, Some(2), Some(2), Some(3), Some(4)]
@@ -125,7 +125,10 @@ async fn empty_sources_before_and_after_nonempty_source() {
         ("first", vec![empty.clone(), data.clone()]),
         ("last", vec![data.clone(), empty.clone()]),
     ] {
-        let merged = merge(&sources, temp.path().join(name)).await.unwrap();
+        let merged = Merger::new(&sources)
+            .merge(temp.path().join(name))
+            .await
+            .unwrap();
         assert_eq!(values(&merged).await, vec![Some(7)]);
     }
 }
@@ -135,7 +138,10 @@ async fn all_empty_sources_produce_readable_empty_dataset() {
     let temp = TempDir::new().unwrap();
     let empty = write(&temp.path().join("empty.lance"), vec![]).await;
     let target = temp.path().join("merged.lance");
-    merge(&[empty.clone(), empty], &target).await.unwrap();
+    Merger::new(&[empty.clone(), empty])
+        .merge(&target)
+        .await
+        .unwrap();
     let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
     assert!(reopened.manifest.fragments.is_empty());
     assert_eq!(reopened.count_rows(None).await.unwrap(), 0);
@@ -148,7 +154,7 @@ async fn all_empty_sources_produce_readable_empty_dataset() {
 async fn no_sources_is_an_error_without_output() {
     let temp = TempDir::new().unwrap();
     let target = temp.path().join("merged.lance");
-    let error = merge(&[], &target).await.err().unwrap();
+    let error = Merger::new(&[]).merge(&target).await.err().unwrap();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
     assert!(error.to_string().contains("At least one source"));
     assert!(!target.exists());
