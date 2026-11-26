@@ -35,3 +35,15 @@ handle does not pin files against source-side cleanup.
 Run `cargo test --locked` to exercise real datasets in temporary local directories.
 Tests also compare source file bytes before/after merging and reopen the result
 with the standard Lance reader. Tests are run manually; no CI is configured.
+
+The integration suite covers single/repeated sources, multiple fragments, NULLs,
+duplicates, empty sources in either position, all-empty sources, snapshot isolation
+after an append, shallow clones with colliding base IDs, and concurrent destination
+creation. It also verifies that schema mismatches, deletions, stable row IDs, and
+existing destinations fail without publishing an output or altering an existing
+dataset. Existing directories (even empty ones) are rejected as destinations.
+
+The two implementation stages are intentionally stacked: merge the core library
+PR first, then the boundary-test/documentation PR. No source indices are reused;
+queries against the merged dataset use ordinary scans until callers build new
+indices themselves.

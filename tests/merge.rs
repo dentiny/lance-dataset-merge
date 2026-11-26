@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
-use lance::dataset::WriteParams;
+use lance::dataset::{WriteMode, WriteParams};
 use lance_dataset_merge::merge;
 use tempfile::TempDir;
 
@@ -152,4 +152,183 @@ async fn no_sources_is_an_error_without_output() {
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
     assert!(error.to_string().contains("At least one source"));
     assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn single_and_repeated_source_keep_all_rows() {
+    let temp = TempDir::new().unwrap();
+    let source = write(&temp.path().join("source.lance"), vec![Some(5), None]).await;
+    let single = merge(std::slice::from_ref(&source), temp.path().join("single"))
+        .await
+        .unwrap();
+    assert_eq!(values(&single).await, vec![Some(5), None]);
+    let repeated = merge(&[source.clone(), source], temp.path().join("repeated"))
+        .await
+        .unwrap();
+    assert_eq!(values(&repeated).await, vec![Some(5), None, Some(5), None]);
+    assert_eq!(repeated.manifest.base_paths.len(), 1);
+}
+
+#[tokio::test]
+async fn existing_destination_is_unchanged() {
+    let temp = TempDir::new().unwrap();
+    let source = write(&temp.path().join("source"), vec![Some(1)]).await;
+    let target = temp.path().join("target");
+    write(&target, vec![Some(99)]).await;
+    let before = files(&target);
+    let error = merge(std::slice::from_ref(&source), &target)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("Destination already exists"));
+    assert_eq!(before, files(&target));
+    // The source itself is also an existing destination, even through a path alias.
+    let alias = temp.path().join("target/../source");
+    assert!(merge(&[source], &alias).await.is_err());
+}
+
+#[tokio::test]
+async fn schema_mismatch_including_an_empty_source_writes_nothing() {
+    let temp = TempDir::new().unwrap();
+    let source = write(&temp.path().join("source"), vec![Some(1)]).await;
+    let other_schema = Arc::new(Schema::new(vec![Field::new(
+        "different",
+        DataType::Int32,
+        true,
+    )]));
+    let empty_reader = RecordBatchIterator::new(
+        Vec::<Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+        other_schema,
+    );
+    let other = Dataset::write(
+        empty_reader,
+        temp.path().join("other").to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = temp.path().join("merged");
+    let error = merge(&[source, other], &target).await.err().unwrap();
+    assert!(matches!(error, lance_core::Error::SchemaMismatch { .. }));
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn deletions_are_rejected_before_writing() {
+    let temp = TempDir::new().unwrap();
+    let source = write(&temp.path().join("source"), vec![Some(1), Some(2)]).await;
+    let mut deleted = write(&temp.path().join("deleted"), vec![Some(3), Some(4)]).await;
+    deleted.delete("value = 3").await.unwrap();
+    assert!(
+        deleted
+            .manifest
+            .fragments
+            .iter()
+            .any(|fragment| fragment.deletion_file.is_some())
+    );
+    let target = temp.path().join("merged");
+    let error = merge(&[source, deleted], &target).await.err().unwrap();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("deletions"));
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn stable_row_ids_are_rejected_even_for_empty_datasets() {
+    let temp = TempDir::new().unwrap();
+    let reader = RecordBatchIterator::new(
+        Vec::<Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+        schema(),
+    );
+    let source = Dataset::write(
+        reader,
+        temp.path().join("source").to_str().unwrap(),
+        Some(WriteParams {
+            enable_stable_row_ids: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let target = temp.path().join("merged");
+    let error = merge(&[source], &target).await.err().unwrap();
+    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+    assert!(error.to_string().contains("Stable row IDs"));
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn uses_the_open_snapshot_after_source_append() {
+    let temp = TempDir::new().unwrap();
+    let source_path = temp.path().join("source");
+    let snapshot = write(&source_path, vec![Some(1)]).await;
+    let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+    let latest = Dataset::write(
+        reader,
+        source_path.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(latest.version_id() > snapshot.version_id());
+    let before = files(&source_path);
+    let result = merge(&[snapshot], temp.path().join("merged"))
+        .await
+        .unwrap();
+    assert_eq!(values(&result).await, vec![Some(1)]);
+    assert_eq!(values(&latest).await, vec![Some(1), Some(2)]);
+    assert_eq!(before, files(&source_path));
+}
+
+#[tokio::test]
+async fn shallow_clones_remap_colliding_base_ids() {
+    let temp = TempDir::new().unwrap();
+    let mut left = write(&temp.path().join("left"), vec![Some(1), Some(2), Some(3)]).await;
+    let mut right = write(&temp.path().join("right"), vec![Some(4)]).await;
+    let clone_left = left
+        .shallow_clone(
+            temp.path().join("clone_left").to_str().unwrap(),
+            left.version_id(),
+            None,
+        )
+        .await
+        .unwrap();
+    let clone_right = right
+        .shallow_clone(
+            temp.path().join("clone_right").to_str().unwrap(),
+            right.version_id(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        clone_left.manifest.fragments[0].files[0].base_id,
+        clone_right.manifest.fragments[0].files[0].base_id
+    );
+    let target = temp.path().join("merged");
+    merge(&[clone_left, clone_right], &target).await.unwrap();
+    let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        values(&reopened).await,
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+    assert_eq!(reopened.manifest.base_paths.len(), 2);
+    assert!(!target.join("data").exists());
+}
+
+#[tokio::test]
+async fn concurrent_creators_never_overwrite_each_other() {
+    let temp = TempDir::new().unwrap();
+    let sources = [write(&temp.path().join("source"), vec![Some(1), Some(2)]).await];
+    let target = temp.path().join("merged");
+    let (a, b) = tokio::join!(merge(&sources, &target), merge(&sources, &target));
+    assert_ne!(a.is_ok(), b.is_ok());
+    let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.version_id(), 1);
+    assert_eq!(values(&reopened).await, vec![Some(1), Some(2)]);
 }
