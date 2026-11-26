@@ -29,12 +29,14 @@ impl<'a> Merger<'a> {
 
     /// Concatenate snapshots into a new dataset without copying or rewriting data.
     ///
-    /// Inputs are already-open snapshots; this method never checks out newer versions.
+    /// Each source must have exactly one version: its initial version 1.
     /// Rows, including duplicates, are retained in source/fragment order (use an
     /// ordered scanner if order matters). The destination must not already exist.
     /// Sources must have identical schemas, including field IDs and metadata, and
-    /// homogeneous V2 data files. Deletions, stable row IDs, row lineage, overlays,
+    /// homogeneous V2 data files. Deletions, spilled row lineage, overlays,
     /// dictionaries, blobs, and MemWAL are unsupported and rejected before writing.
+    /// Source row IDs and version lineage are not inherited. If any input uses
+    /// stable row IDs, Lance allocates fresh stable IDs for every output row.
     /// Secondary indices, table config, and table metadata are not inherited.
     ///
     /// All locations are object storage URIs passed through to Lance unchanged.
@@ -88,8 +90,11 @@ impl<'a> Merger<'a> {
             source
                 .schema()
                 .check_compatible(first.schema(), &comparison)?;
-            if manifest.uses_stable_row_ids() {
-                return Err(Error::invalid_input("Stable row IDs are not supported"));
+            if source.version_id() != 1 || source.count_versions().await? != 1 {
+                return Err(Error::invalid_input(format!(
+                    "Source {} must have exactly one version (initial version 1)",
+                    source.uri()
+                )));
             }
             if source.schema().has_dictionary_types()
                 || source
@@ -117,13 +122,9 @@ impl<'a> Merger<'a> {
                         "Sources with deletions are not supported",
                     ));
                 }
-                if fragment.row_id_meta.is_some()
-                    || fragment.created_at_version_meta.is_some()
-                    || fragment.last_updated_at_version_meta.is_some()
-                    || !fragment.overlays.is_empty()
-                {
+                if fragment.has_spilled_row_lineage() || !fragment.overlays.is_empty() {
                     return Err(Error::invalid_input(
-                        "Row lineage and overlays are not supported",
+                        "Spilled row lineage and overlays are not supported",
                     ));
                 }
                 if fragments.len() >= u32::MAX as usize {
@@ -132,6 +133,10 @@ impl<'a> Merger<'a> {
                 let mut fragment = fragment.clone();
                 // Let Lance allocate fresh, ordered fragment IDs at commit time.
                 fragment.id = 0;
+                // Output rows have a new identity; do not inherit source-local IDs.
+                fragment.row_id_meta = None;
+                fragment.created_at_version_meta = None;
+                fragment.last_updated_at_version_meta = None;
                 for file in &mut fragment.files {
                     if file.file_major_version < 2 {
                         return Err(Error::invalid_input("Only V2 data files are supported"));
@@ -181,7 +186,11 @@ impl<'a> Merger<'a> {
         };
         CommitBuilder::new(destination)
             .with_session(first.session())
-            .use_stable_row_ids(false)
+            .use_stable_row_ids(
+                sources
+                    .iter()
+                    .any(|source| source.manifest.uses_stable_row_ids()),
+            )
             .with_skip_auto_cleanup(true)
             .with_max_retries(0)
             .execute(Transaction::new(0, operation, None))

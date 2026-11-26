@@ -11,6 +11,8 @@ Assumptions:
   its object store. Local datasets are used only as test fixtures.
 - **No deletions:** source datasets have no deletion files. Inputs that violate
   this assumption are rejected; merging deletion vectors is outside the scope.
+- **One version per source:** every source must have only its initial version 1.
+  Updated datasets and old snapshots of datasets with later versions are rejected.
 
 ```rust,no_run
 use lance::Dataset;
@@ -32,10 +34,11 @@ rows, NULLs, and source/fragment order. Use an ordered scanner when order matter
 An empty source list is an error; empty datasets with a schema are valid inputs,
 including when every input is empty. The destination must not already exist.
 
-`Merger::new(&sources)` borrows open `Dataset` handles, so each input uses the version already loaded
-in that handle. Schemas must match, including internal field IDs and metadata.
-Homogeneous V2 data files are supported; stable row IDs, row lineage, overlays,
-dictionary/blob columns, and MemWAL are rejected.
+`Merger::new(&sources)` borrows open `Dataset` handles at version 1. Schemas must match, including internal field IDs and metadata.
+Homogeneous V2 data files and inline stable row IDs are supported. If any source
+uses stable row IDs, Lance allocates fresh, unique stable IDs for all output rows.
+Source row IDs and per-row version lineage are not preserved. Spilled row lineage
+in hidden data columns, overlays, dictionary/blob columns, and MemWAL are rejected.
 Secondary indices, table config, and table metadata are not inherited. No CLI.
 Enable the required Lance storage backend in the consuming application (for
 example, the `aws` feature on its `lance` dependency for S3).
