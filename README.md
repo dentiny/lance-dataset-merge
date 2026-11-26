@@ -1,7 +1,7 @@
 # lance-dataset-merge
 
 A Rust library for metadata-only concatenation of local Lance datasets. Uses
-Lance **14.0.1** with an exact dependency pin and a checked-in `Cargo.lock`.
+Lance **14.0.1** with standard Cargo version requirements and a checked-in `Cargo.lock`.
 
 ```rust,no_run
 use lance::Dataset;
