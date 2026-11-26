@@ -10,7 +10,7 @@ use lance::index::DatasetIndexExt;
 use lance_core::datatypes::SchemaCompareOptions;
 use lance_core::{Error, Result};
 use lance_table::feature_flags::ensure_can_read_manifest;
-use lance_table::format::BasePath;
+use lance_table::format::{BasePath, Fragment};
 
 /// Merges borrowed Lance dataset snapshots without rewriting their data files.
 ///
@@ -94,19 +94,7 @@ impl<'a> Merger<'a> {
             // Resolve inherited bases individually: their IDs are local to each source.
             let root = source.uri().to_owned();
             for fragment in manifest.fragments.iter() {
-                if fragment.deletion_file.is_some() {
-                    return Err(Error::invalid_input(
-                        "Sources with deletions are not supported",
-                    ));
-                }
-                if fragment.has_spilled_row_lineage() || !fragment.overlays.is_empty() {
-                    return Err(Error::invalid_input(
-                        "Spilled row lineage and overlays are not supported",
-                    ));
-                }
-                if fragments.len() >= u32::MAX as usize {
-                    return Err(Error::invalid_input("Fragment ID space exhausted"));
-                }
+                validate_fragment(fragment, fragments.len())?;
                 let mut fragment = fragment.clone();
                 // Let Lance allocate fresh, ordered fragment IDs at commit time.
                 fragment.id = 0;
@@ -199,6 +187,23 @@ async fn validate_source(source: &Dataset) -> Result<()> {
             .is_some_and(|details| details.type_url.to_ascii_lowercase().contains("memwal"))
     }) {
         return Err(Error::invalid_input("MemWAL datasets are not supported"));
+    }
+    Ok(())
+}
+
+fn validate_fragment(fragment: &Fragment, fragment_count: usize) -> Result<()> {
+    if fragment.deletion_file.is_some() {
+        return Err(Error::invalid_input(
+            "Sources with deletions are not supported",
+        ));
+    }
+    if fragment.has_spilled_row_lineage() || !fragment.overlays.is_empty() {
+        return Err(Error::invalid_input(
+            "Spilled row lineage and overlays are not supported",
+        ));
+    }
+    if fragment_count >= u32::MAX as usize {
+        return Err(Error::invalid_input("Fragment ID space exhausted"));
     }
     Ok(())
 }
