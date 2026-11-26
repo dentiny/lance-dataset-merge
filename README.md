@@ -52,9 +52,9 @@ Tests also compare source file bytes before/after merging and reopen the result
 with the standard Lance reader. Tests are run manually; no CI is configured.
 
 The integration suite covers single/repeated sources, multiple fragments, NULLs,
-duplicates, empty sources in either position, all-empty sources, snapshot isolation
-after an append, shallow clones with colliding base IDs, and concurrent destination
-creation. It also verifies that schema mismatches, deletions, stable row IDs, and
+duplicates, empty sources in either position, all-empty sources, rejection of old and latest snapshots
+of multi-version datasets, shallow clones with colliding base IDs, and concurrent destination
+creation. It also verifies that schema mismatches, updated datasets with deletions, and
 existing destinations fail without publishing an output or altering an existing
 dataset. An empty storage prefix is a valid destination.
 

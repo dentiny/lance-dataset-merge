@@ -240,7 +240,7 @@ async fn schema_mismatch_including_an_empty_source_writes_nothing() {
 }
 
 #[tokio::test]
-async fn deletions_are_rejected_before_writing() {
+async fn updated_sources_with_deletions_are_rejected_before_writing() {
     let temp = TempDir::new().unwrap();
     let source = write(&temp.path().join("source"), vec![Some(1), Some(2)]).await;
     let mut deleted = write(&temp.path().join("deleted"), vec![Some(3), Some(4)]).await;
@@ -259,12 +259,12 @@ async fn deletions_are_rejected_before_writing() {
         .err()
         .unwrap();
     assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("deletions"));
+    assert!(error.to_string().contains("exactly one version"));
     assert!(!target.exists());
 }
 
 #[tokio::test]
-async fn stable_row_ids_are_rejected_even_for_empty_datasets() {
+async fn empty_single_version_sources_with_stable_row_ids_are_supported() {
     let temp = TempDir::new().unwrap();
     let reader = RecordBatchIterator::new(
         Vec::<Result<RecordBatch, arrow_schema::ArrowError>>::new(),
@@ -281,18 +281,17 @@ async fn stable_row_ids_are_rejected_even_for_empty_datasets() {
     .await
     .unwrap();
     let target = temp.path().join("merged");
-    let error = Merger::new(&[source])
+    let result = Merger::new(&[source])
         .merge(target.to_str().unwrap())
         .await
-        .err()
         .unwrap();
-    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("Stable row IDs"));
-    assert!(!target.exists());
+    assert!(result.manifest.uses_stable_row_ids());
+    assert_eq!(result.count_rows(None).await.unwrap(), 0);
+    assert_eq!(result.version_id(), 1);
 }
 
 #[tokio::test]
-async fn uses_the_open_snapshot_after_source_append() {
+async fn rejects_old_and_latest_snapshots_of_multiversion_sources() {
     let temp = TempDir::new().unwrap();
     let source_path = temp.path().join("source");
     let snapshot = write(&source_path, vec![Some(1)]).await;
@@ -310,12 +309,17 @@ async fn uses_the_open_snapshot_after_source_append() {
     .unwrap();
     assert!(latest.version_id() > snapshot.version_id());
     let before = files(&source_path);
-    let result = Merger::new(&[snapshot])
-        .merge(temp.path().join("merged").to_str().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(values(&result).await, vec![Some(1)]);
-    assert_eq!(values(&latest).await, vec![Some(1), Some(2)]);
+    for (name, source) in [("old", snapshot), ("latest", latest)] {
+        let target = temp.path().join(name);
+        let error = Merger::new(&[source])
+            .merge(target.to_str().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("exactly one version"));
+        assert!(!target.exists());
+    }
     assert_eq!(before, files(&source_path));
 }
 
