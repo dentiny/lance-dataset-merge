@@ -419,3 +419,60 @@ async fn merges_object_store_uris_without_filesystem_resolution() {
     assert!(error.to_string().contains("Destination already exists"));
     assert_eq!(reopened.version_id(), 1);
 }
+
+#[tokio::test]
+async fn single_version_sources_receive_fresh_stable_row_ids() {
+    let temp = TempDir::new().unwrap();
+    let mut sources = Vec::new();
+    let paths = [temp.path().join("left"), temp.path().join("right")];
+    for (path, data) in paths.iter().zip([vec![1, 2], vec![3, 4]]) {
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(data))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let source = Dataset::write(
+            reader,
+            path.to_str().unwrap(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let batch = source.scan().with_row_id().try_into_batch().await.unwrap();
+        let ids = batch["_rowid"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(ids.values().as_ref(), &[0, 1]);
+        sources.push(source);
+    }
+    let before = paths.iter().map(|path| files(path)).collect::<Vec<_>>();
+    let target = temp.path().join("merged");
+    Merger::new(&sources)
+        .merge(target.to_str().unwrap())
+        .await
+        .unwrap();
+    let merged = Dataset::open(target.to_str().unwrap()).await.unwrap();
+    assert!(merged.manifest.uses_stable_row_ids());
+    assert_eq!(
+        values(&merged).await,
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+    let batch = merged
+        .scan()
+        .scan_in_order(true)
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["_rowid"]
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(ids.values().as_ref(), &[0, 1, 2, 3]);
+    assert!(!target.join("data").exists());
+    assert_eq!(
+        before,
+        paths.iter().map(|path| files(path)).collect::<Vec<_>>()
+    );
+}
