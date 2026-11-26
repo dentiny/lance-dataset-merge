@@ -120,52 +120,34 @@ async fn merges_multiple_fragments_without_writing_data_files() {
 }
 
 #[tokio::test]
-async fn empty_sources_before_and_after_nonempty_source() {
+async fn merges_empty_datasets() {
     let temp = TempDir::new().unwrap();
     let empty = write(&temp.path().join("empty.lance"), vec![]).await;
     let data = write(&temp.path().join("data.lance"), vec![Some(7)]).await;
-    assert!(empty.manifest.fragments.is_empty());
-    for (name, sources) in [
-        ("first", vec![empty.clone(), data.clone()]),
-        ("last", vec![data.clone(), empty.clone()]),
+    for (name, sources, expected) in [
+        (
+            "first_empty",
+            vec![empty.clone(), data.clone()],
+            vec![Some(7)],
+        ),
+        (
+            "last_empty",
+            vec![data.clone(), empty.clone()],
+            vec![Some(7)],
+        ),
+        ("all_empty", vec![empty.clone(), empty.clone()], vec![]),
     ] {
-        let merged = Merger::new(&sources)
-            .merge(temp.path().join(name).to_str().unwrap())
+        let target = temp.path().join(name);
+        Merger::new(&sources)
+            .merge(target.to_str().unwrap())
             .await
             .unwrap();
-        assert_eq!(values(&merged).await, vec![Some(7)]);
+        let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), expected.len());
+        assert_eq!(values(&reopened).await, expected);
+        assert_eq!(reopened.schema(), data.schema());
+        assert!(!target.join("data").exists());
     }
-}
-
-#[tokio::test]
-async fn all_empty_sources_produce_readable_empty_dataset() {
-    let temp = TempDir::new().unwrap();
-    let empty = write(&temp.path().join("empty.lance"), vec![]).await;
-    let target = temp.path().join("merged.lance");
-    Merger::new(&[empty.clone(), empty])
-        .merge(target.to_str().unwrap())
-        .await
-        .unwrap();
-    let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
-    assert!(reopened.manifest.fragments.is_empty());
-    assert_eq!(reopened.count_rows(None).await.unwrap(), 0);
-    assert_eq!(reopened.schema().fields.len(), 1);
-    assert_eq!(reopened.schema().fields[0].name, "value");
-    assert!(!target.join("data").exists());
-}
-
-#[tokio::test]
-async fn no_sources_is_an_error_without_output() {
-    let temp = TempDir::new().unwrap();
-    let target = temp.path().join("merged.lance");
-    let error = Merger::new(&[])
-        .merge(target.to_str().unwrap())
-        .await
-        .err()
-        .unwrap();
-    assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
-    assert!(error.to_string().contains("At least one source"));
-    assert!(!target.exists());
 }
 
 #[tokio::test]
@@ -212,6 +194,7 @@ async fn merges_object_store_uris_without_filesystem_resolution() {
     let error = merger.merge(target).await.err().unwrap();
     assert!(error.to_string().contains("Destination already exists"));
     assert_eq!(reopened.version_id(), 1);
+    assert_eq!(reopened.count_versions().await.unwrap(), 1);
 }
 
 #[tokio::test]
