@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::path::Path;
 
 use lance::Dataset;
+use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{
     CommitBuilder,
     transaction::{Operation, Transaction},
@@ -27,7 +27,7 @@ impl<'a> Merger<'a> {
         Self { sources }
     }
 
-    /// Concatenate snapshots into a new local dataset without copying or rewriting data.
+    /// Concatenate snapshots into a new dataset without copying or rewriting data.
     ///
     /// Inputs are already-open snapshots; this method never checks out newer versions.
     /// Rows, including duplicates, are retained in source/fragment order (use an
@@ -37,36 +37,40 @@ impl<'a> Merger<'a> {
     /// dictionaries, blobs, and MemWAL are unsupported and rejected before writing.
     /// Secondary indices, table config, and table metadata are not inherited.
     ///
-    /// Source URIs and external base paths must be local filesystem paths. Relative
-    /// source paths are resolved against the current working directory. Do not move
-    /// or clean up referenced files while the destination is in use.
+    /// All locations are object storage URIs passed through to Lance unchanged.
+    /// Sources are assumed to have no deletions. Do not move or clean up referenced
+    /// objects while the destination is in use.
     ///
     /// ```no_run
     /// # async fn example() -> lance_core::Result<()> {
-    /// let left = lance::Dataset::open("/data/left.lance").await?;
-    /// let right = lance::Dataset::open("/data/right.lance").await?;
+    /// let left = lance::Dataset::open("s3://bucket/left.lance").await?;
+    /// let right = lance::Dataset::open("s3://bucket/right.lance").await?;
     /// let sources = [left, right];
     /// let merger = lance_dataset_merge::Merger::new(&sources);
-    /// let merged = merger.merge("/data/merged.lance").await?;
+    /// let merged = merger.merge("s3://bucket/merged.lance").await?;
     /// assert_eq!(merged.version_id(), 1);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn merge(&self, destination: impl AsRef<Path>) -> Result<Dataset> {
+    pub async fn merge(&self, destination: impl AsRef<str>) -> Result<Dataset> {
         let sources = self.sources;
         let first = sources
             .first()
             .ok_or_else(|| Error::invalid_input("At least one source dataset is required"))?;
-        let destination = std::path::absolute(destination)?;
-        if destination.try_exists()? {
-            return Err(Error::invalid_input(format!(
-                "Destination already exists: {}",
-                destination.display()
-            )));
+        let destination = destination.as_ref();
+        match DatasetBuilder::from_uri(destination)
+            .with_session(first.session())
+            .load()
+            .await
+        {
+            Ok(_) => {
+                return Err(Error::invalid_input(format!(
+                    "Destination already exists: {destination}"
+                )));
+            }
+            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {}
+            Err(error) => return Err(error),
         }
-        let destination = destination
-            .to_str()
-            .ok_or_else(|| Error::invalid_input("Destination path must be UTF-8"))?;
         let comparison = SchemaCompareOptions {
             compare_metadata: true,
             compare_dictionary: true,
@@ -107,7 +111,7 @@ impl<'a> Merger<'a> {
                 return Err(Error::invalid_input("MemWAL datasets are not supported"));
             }
             // Resolve inherited bases individually: their IDs are local to each source.
-            let root = local_path(source.uri())?;
+            let root = source.uri().to_owned();
             for fragment in manifest.fragments.iter() {
                 if fragment.deletion_file.is_some() {
                     return Err(Error::invalid_input(
@@ -149,7 +153,7 @@ impl<'a> Merger<'a> {
                                     source.uri()
                                 ))
                             })?;
-                            (local_path(&base.path)?, base.is_dataset_root)
+                            (base.path.clone(), base.is_dataset_root)
                         }
                     };
                     let key = (path.clone(), is_dataset_root);
@@ -177,22 +181,11 @@ impl<'a> Merger<'a> {
             initial_bases: Some(bases),
         };
         CommitBuilder::new(destination)
+            .with_session(first.session())
             .use_stable_row_ids(false)
             .with_skip_auto_cleanup(true)
             .with_max_retries(0)
             .execute(Transaction::new(0, operation, None))
             .await
     }
-}
-
-fn local_path(path: &str) -> Result<String> {
-    if path.contains("://") {
-        return Err(Error::invalid_input(format!(
-            "Only local filesystem paths are supported: {path}"
-        )));
-    }
-    std::fs::canonicalize(path)?
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| Error::invalid_input(format!("Source path must be UTF-8: {path}")))
 }
