@@ -308,7 +308,7 @@ async fn rejects_old_and_latest_snapshots_of_multiversion_sources() {
     )
     .await
     .unwrap();
-    assert!(latest.version_id() > snapshot.version_id());
+    assert_gt!(latest.version_id(), snapshot.version_id());
     let before = files(&source_path);
     for (name, source) in [("old", snapshot), ("latest", latest)] {
         let target = temp.path().join(name);
