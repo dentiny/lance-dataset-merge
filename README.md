@@ -5,23 +5,25 @@ Lance **14.0.1** with standard Cargo version requirements and a checked-in `Carg
 
 ```rust,no_run
 use lance::Dataset;
-use lance_dataset_merge::merge;
+use lance_dataset_merge::Merger;
 
 # async fn example() -> lance_core::Result<()> {
 let a = Dataset::open("/data/a.lance").await?;
 let b = Dataset::open("/data/b.lance").await?;
-let output = merge(&[a, b], "/data/combined.lance").await?;
+let sources = [a, b];
+let merger = Merger::new(&sources);
+let output = merger.merge("/data/combined.lance").await?;
 # Ok(())
 # }
 ```
 
-`merge` creates a new dataset manifest referring to the original data files.
+`Merger::merge` creates a new dataset manifest referring to the original data files.
 It does not copy or rewrite data files or invoke compaction. It retains duplicate
 rows, NULLs, and source/fragment order. Use an ordered scanner when order matters.
 An empty source list is an error; empty datasets with a schema are valid inputs,
 including when every input is empty. The destination must not already exist.
 
-Sources are open `Dataset` handles, so each input uses the version already loaded
+`Merger::new(&sources)` borrows open `Dataset` handles, so each input uses the version already loaded
 in that handle. Schemas must match, including internal field IDs and metadata.
 The initial implementation supports homogeneous V2 data files and local filesystem
 paths (including local external bases from shallow clones). Deletions, stable row

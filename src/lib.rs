@@ -3,6 +3,6 @@
 //! The output references the original files. Keep those files alive for as long
 //! as the output is needed; source cleanup does not track these references.
 
-mod merge;
+mod merger;
 
-pub use merge::merge;
+pub use merger::Merger;
