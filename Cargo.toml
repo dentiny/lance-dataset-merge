@@ -15,5 +15,6 @@ lance-table = "14.0.1"
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
 futures = "0.3"
+more-asserts = "0.3.1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
