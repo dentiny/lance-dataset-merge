@@ -76,7 +76,10 @@ async fn merges_multiple_fragments_without_writing_data_files() {
     let left = write(&left_path, vec![Some(1), None, Some(2)]).await;
     let right = write(&right_path, vec![Some(2), Some(3), Some(4)]).await;
     let expected_fragments = left.manifest.fragments.len() + right.manifest.fragments.len();
-    assert!(left.manifest.fragments.len() > 1);
+    assert_eq!(left.manifest.fragments.len(), 2);
+    assert_eq!(right.manifest.fragments.len(), 2);
+    assert_eq!(left.count_rows(None).await.unwrap(), 3);
+    assert_eq!(right.count_rows(None).await.unwrap(), 3);
     // Both independently-created sources start allocating fragment IDs at zero.
     assert_eq!(
         left.manifest.fragments[0].id,
@@ -84,7 +87,8 @@ async fn merges_multiple_fragments_without_writing_data_files() {
     );
     let before = (files(&left_path), files(&right_path));
     let target = temp.path().join("merged.lance");
-    let result = Merger::new(&[left, right])
+    let sources = [left, right];
+    let result = Merger::new(&sources)
         .merge(target.to_str().unwrap())
         .await
         .unwrap();
@@ -93,7 +97,34 @@ async fn merges_multiple_fragments_without_writing_data_files() {
         vec![Some(1), None, Some(2), Some(2), Some(3), Some(4)]
     );
     assert_eq!(result.version_id(), 1);
+    assert_eq!(result.count_versions().await.unwrap(), 1);
+    assert_eq!(result.count_rows(None).await.unwrap(), 6);
+    assert_eq!(result.schema(), sources[0].schema());
+    assert_eq!(result.schema().metadata, sources[0].schema().metadata);
+    assert_eq!(result.manifest.base_paths.len(), 2);
     assert_eq!(result.manifest.fragments.len(), expected_fragments);
+    let source_fragments = sources.iter().flat_map(|source| {
+        source
+            .manifest
+            .fragments
+            .iter()
+            .map(move |fragment| (source, fragment))
+    });
+    for (merged, (source, original)) in result.manifest.fragments.iter().zip(source_fragments) {
+        assert_eq!(merged.physical_rows, original.physical_rows);
+        assert_eq!(merged.files.len(), original.files.len());
+        assert!(merged.deletion_file.is_none());
+        assert!(merged.row_id_meta.is_none());
+        assert!(merged.overlays.is_empty());
+        for (merged_file, original_file) in merged.files.iter().zip(&original.files) {
+            let base = &result.manifest.base_paths[&merged_file.base_id.unwrap()];
+            assert_eq!(base.path, source.uri());
+            assert!(base.is_dataset_root);
+            let mut expected_file = original_file.clone();
+            expected_file.base_id = merged_file.base_id;
+            assert_eq!(merged_file, &expected_file);
+        }
+    }
     assert_eq!(
         result
             .manifest
@@ -116,6 +147,10 @@ async fn merges_multiple_fragments_without_writing_data_files() {
     // Reopening proves base references are persisted, rather than held only in memory.
     let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
     assert_eq!(values(&reopened).await, values(&result).await);
+    assert_eq!(reopened.count_rows(None).await.unwrap(), 6);
+    assert_eq!(reopened.manifest.fragments.len(), expected_fragments);
+    assert_eq!(reopened.manifest.base_paths.len(), 2);
+    assert_eq!(reopened.schema(), result.schema());
 }
 
 #[tokio::test]
@@ -128,11 +163,20 @@ async fn empty_sources_before_and_after_nonempty_source() {
         ("first", vec![empty.clone(), data.clone()]),
         ("last", vec![data.clone(), empty.clone()]),
     ] {
+        let target = temp.path().join(name);
         let merged = Merger::new(&sources)
-            .merge(temp.path().join(name).to_str().unwrap())
+            .merge(target.to_str().unwrap())
             .await
             .unwrap();
         assert_eq!(values(&merged).await, vec![Some(7)]);
+        assert_eq!(merged.count_rows(None).await.unwrap(), 1);
+        assert_eq!(
+            merged.manifest.fragments.len(),
+            data.manifest.fragments.len()
+        );
+        assert_eq!(merged.manifest.base_paths.len(), 1);
+        assert_eq!(merged.schema(), data.schema());
+        assert!(!target.join("data").exists());
     }
 }
 
@@ -147,6 +191,9 @@ async fn all_empty_sources_produce_readable_empty_dataset() {
         .unwrap();
     let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
     assert!(reopened.manifest.fragments.is_empty());
+    assert!(reopened.manifest.base_paths.is_empty());
+    assert_eq!(reopened.version_id(), 1);
+    assert_eq!(reopened.count_versions().await.unwrap(), 1);
     assert_eq!(reopened.count_rows(None).await.unwrap(), 0);
     assert_eq!(reopened.schema().fields.len(), 1);
     assert_eq!(reopened.schema().fields[0].name, "value");
