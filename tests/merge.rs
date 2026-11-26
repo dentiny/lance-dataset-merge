@@ -7,6 +7,7 @@ use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
 use lance::dataset::{WriteMode, WriteParams};
 use lance_dataset_merge::Merger;
+use more_asserts::assert_gt;
 use tempfile::TempDir;
 
 fn schema() -> Arc<Schema> {
@@ -76,7 +77,7 @@ async fn merges_multiple_fragments_without_writing_data_files() {
     let left = write(&left_path, vec![Some(1), None, Some(2)]).await;
     let right = write(&right_path, vec![Some(2), Some(3), Some(4)]).await;
     let expected_fragments = left.manifest.fragments.len() + right.manifest.fragments.len();
-    assert!(left.manifest.fragments.len() > 1);
+    assert_gt!(left.manifest.fragments.len(), 1);
     // Both independently-created sources start allocating fragment IDs at zero.
     assert_eq!(
         left.manifest.fragments[0].id,
