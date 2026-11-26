@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 
 use lance::Dataset;
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{
     CommitBuilder,
     transaction::{Operation, Transaction},
 };
-use lance::index::DatasetIndexExt;
-use lance_core::datatypes::SchemaCompareOptions;
-use lance_core::{Error, Result};
-use lance_table::feature_flags::ensure_can_read_manifest;
-use lance_table::format::{BasePath, Fragment};
+use lance_core::Result;
+use lance_table::format::BasePath;
+
+use crate::validation;
 
 /// Merges borrowed Lance dataset snapshots without rewriting their data files.
 ///
@@ -56,29 +54,8 @@ impl<'a> Merger<'a> {
     /// ```
     pub async fn merge(&self, destination: impl AsRef<str>) -> Result<Dataset> {
         let sources = self.sources;
-        let first = sources
-            .first()
-            .ok_or_else(|| Error::invalid_input("At least one source dataset is required"))?;
         let destination = destination.as_ref();
-        match DatasetBuilder::from_uri(destination)
-            .with_session(first.session())
-            .load()
-            .await
-        {
-            Ok(_) => {
-                return Err(Error::invalid_input(format!(
-                    "Destination already exists: {destination}"
-                )));
-            }
-            Err(Error::DatasetNotFound { .. } | Error::NotFound { .. }) => {}
-            Err(error) => return Err(error),
-        }
-        let comparison = SchemaCompareOptions {
-            compare_metadata: true,
-            compare_dictionary: true,
-            compare_field_ids: true,
-            ..Default::default()
-        };
+        let first = validation::validate_inputs(sources, destination).await?;
         let mut fragments = Vec::new();
         let mut bases = Vec::new();
         let mut base_ids = HashMap::new();
@@ -86,15 +63,11 @@ impl<'a> Merger<'a> {
 
         for source in sources {
             let manifest = &source.manifest;
-            ensure_can_read_manifest(manifest)?;
-            source
-                .schema()
-                .check_compatible(first.schema(), &comparison)?;
-            validate_source(source).await?;
+            validation::validate_source(source, first).await?;
             // Resolve inherited bases individually: their IDs are local to each source.
             let root = source.uri().to_owned();
             for fragment in manifest.fragments.iter() {
-                validate_fragment(fragment, fragments.len())?;
+                validation::validate_fragment(fragment, fragments.len())?;
                 let mut fragment = fragment.clone();
                 // Let Lance allocate fresh, ordered fragment IDs at commit time.
                 fragment.id = 0;
@@ -103,25 +76,11 @@ impl<'a> Merger<'a> {
                 fragment.created_at_version_meta = None;
                 fragment.last_updated_at_version_meta = None;
                 for file in &mut fragment.files {
-                    if file.file_major_version < 2 {
-                        return Err(Error::invalid_input("Only V2 data files are supported"));
-                    }
-                    let version = (file.file_major_version, file.file_minor_version);
-                    if file_version.is_some_and(|expected| expected != version) {
-                        return Err(Error::invalid_input(
-                            "Mixed data file versions are not supported",
-                        ));
-                    }
-                    file_version = Some(version);
+                    validation::validate_file(file, &mut file_version)?;
                     let (path, is_dataset_root) = match file.base_id {
                         None => (root.clone(), true),
                         Some(id) => {
-                            let base = manifest.base_paths.get(&id).ok_or_else(|| {
-                                Error::invalid_input(format!(
-                                    "Source {} references missing base ID {id}",
-                                    source.uri()
-                                ))
-                            })?;
+                            let base = validation::validate_base(source, id)?;
                             (base.path.clone(), base.is_dataset_root)
                         }
                     };
@@ -129,8 +88,7 @@ impl<'a> Merger<'a> {
                     let id = match base_ids.get(&key) {
                         Some(id) => *id,
                         None => {
-                            let id = u32::try_from(bases.len())
-                                .map_err(|_| Error::invalid_input("Base ID space exhausted"))?;
+                            let id = validation::validate_base_id(bases.len())?;
                             bases.push(BasePath::new(id, path, None, is_dataset_root));
                             base_ids.insert(key, id);
                             id
@@ -161,49 +119,4 @@ impl<'a> Merger<'a> {
             .execute(Transaction::new(0, operation, None))
             .await
     }
-}
-
-async fn validate_source(source: &Dataset) -> Result<()> {
-    if source.version_id() != 1 || source.count_versions().await? != 1 {
-        return Err(Error::invalid_input(format!(
-            "Source {} must have exactly one version (initial version 1)",
-            source.uri()
-        )));
-    }
-    if source.schema().has_dictionary_types()
-        || source
-            .schema()
-            .fields_pre_order()
-            .any(|field| field.is_blob())
-    {
-        return Err(Error::invalid_input(
-            "Dictionary and blob columns are not supported",
-        ));
-    }
-    if source.load_indices().await?.iter().any(|index| {
-        index
-            .index_details
-            .as_ref()
-            .is_some_and(|details| details.type_url.to_ascii_lowercase().contains("memwal"))
-    }) {
-        return Err(Error::invalid_input("MemWAL datasets are not supported"));
-    }
-    Ok(())
-}
-
-fn validate_fragment(fragment: &Fragment, fragment_count: usize) -> Result<()> {
-    if fragment.deletion_file.is_some() {
-        return Err(Error::invalid_input(
-            "Sources with deletions are not supported",
-        ));
-    }
-    if fragment.has_spilled_row_lineage() || !fragment.overlays.is_empty() {
-        return Err(Error::invalid_input(
-            "Spilled row lineage and overlays are not supported",
-        ));
-    }
-    if fragment_count >= u32::MAX as usize {
-        return Err(Error::invalid_input("Fragment ID space exhausted"));
-    }
-    Ok(())
 }

@@ -4,5 +4,6 @@
 //! as the output is needed; source cleanup does not track these references.
 
 mod merger;
+mod validation;
 
 pub use merger::Merger;
