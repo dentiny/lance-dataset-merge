@@ -34,4 +34,4 @@ handle does not pin files against source-side cleanup.
 
 Run `cargo test --locked` to exercise real datasets in temporary local directories.
 Tests also compare source file bytes before/after merging and reopen the result
-with the standard Lance reader. CI runs formatting, tests, and Clippy.
+with the standard Lance reader. Tests are run manually; no CI is configured.
