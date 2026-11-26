@@ -7,9 +7,9 @@ license = "MIT"
 description = "Metadata-only concatenation of local Lance datasets"
 
 [dependencies]
-lance = { version = "=14.0.1", default-features = false }
-lance-core = "=14.0.1"
-lance-table = "=14.0.1"
+lance = { version = "14.0.1", default-features = false }
+lance-core = "14.0.1"
+lance-table = "14.0.1"
 
 [dev-dependencies]
 arrow-array = "58.0.0"
