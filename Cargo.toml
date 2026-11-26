@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 license = "MIT"
-description = "Metadata-only concatenation of local Lance datasets"
+description = "Metadata-only concatenation of Lance datasets in object storage"
 
 [dependencies]
 lance = { version = "14.0.1", default-features = false }
@@ -15,5 +15,6 @@ lance-table = "14.0.1"
 arrow-array = "58.0.0"
 arrow-schema = "58.0.0"
 futures = "0.3"
+more-asserts = "0.3.1"
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

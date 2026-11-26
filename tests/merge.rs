@@ -1,0 +1,255 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
+use arrow_schema::{DataType, Field, Schema};
+use lance::Dataset;
+use lance::dataset::WriteParams;
+use lance_dataset_merge::Merger;
+use more_asserts::assert_gt;
+use tempfile::TempDir;
+
+fn schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![Field::new(
+        "value",
+        DataType::Int32,
+        true,
+    )]))
+}
+
+async fn write(path: &Path, values: Vec<Option<i32>>) -> Dataset {
+    let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(values))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+    Dataset::write(
+        reader,
+        path.to_str().unwrap(),
+        Some(WriteParams {
+            max_rows_per_file: 2,
+            max_rows_per_group: 2,
+            enable_stable_row_ids: false,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap()
+}
+
+async fn values(dataset: &Dataset) -> Vec<Option<i32>> {
+    let batch = dataset
+        .scan()
+        .scan_in_order(true)
+        .try_into_batch()
+        .await
+        .unwrap();
+    batch["value"]
+        .as_any()
+        .downcast_ref::<Int32Array>()
+        .unwrap()
+        .iter()
+        .collect()
+}
+
+fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(root: &Path, current: &Path, result: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(current).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, result);
+            } else {
+                result.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    std::fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut result = BTreeMap::new();
+    visit(root, root, &mut result);
+    result
+}
+
+#[tokio::test]
+async fn merges_multiple_fragments_without_writing_data_files() {
+    let temp = TempDir::new().unwrap();
+    let left_path = temp.path().join("left.lance");
+    let right_path = temp.path().join("right.lance");
+    let left = write(&left_path, vec![Some(1), None, Some(2)]).await;
+    let right = write(&right_path, vec![Some(2), Some(3), Some(4)]).await;
+    let expected_fragments = left.manifest.fragments.len() + right.manifest.fragments.len();
+    assert_gt!(left.manifest.fragments.len(), 1);
+    // Both independently-created sources start allocating fragment IDs at zero.
+    assert_eq!(
+        left.manifest.fragments[0].id,
+        right.manifest.fragments[0].id
+    );
+    let before = (files(&left_path), files(&right_path));
+    let target = temp.path().join("merged.lance");
+    let result = Merger::new(&[left, right])
+        .merge(target.to_str().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        values(&result).await,
+        vec![Some(1), None, Some(2), Some(2), Some(3), Some(4)]
+    );
+    assert_eq!(result.version_id(), 1);
+    assert_eq!(result.manifest.fragments.len(), expected_fragments);
+    assert_eq!(
+        result
+            .manifest
+            .fragments
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        (0..expected_fragments as u64).collect::<Vec<_>>()
+    );
+    assert!(
+        result
+            .manifest
+            .fragments
+            .iter()
+            .all(|f| f.files.iter().all(|file| file.base_id.is_some()))
+    );
+    assert!(!target.join("data").exists());
+    assert!(!target.join("_indices").exists());
+    assert_eq!(before, (files(&left_path), files(&right_path)));
+    // Reopening proves base references are persisted, rather than held only in memory.
+    let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
+    assert_eq!(values(&reopened).await, values(&result).await);
+}
+
+#[tokio::test]
+async fn merges_empty_datasets() {
+    let temp = TempDir::new().unwrap();
+    let empty = write(&temp.path().join("empty.lance"), vec![]).await;
+    let data = write(&temp.path().join("data.lance"), vec![Some(7)]).await;
+    for (name, sources, expected) in [
+        (
+            "first_empty",
+            vec![empty.clone(), data.clone()],
+            vec![Some(7)],
+        ),
+        (
+            "last_empty",
+            vec![data.clone(), empty.clone()],
+            vec![Some(7)],
+        ),
+        ("all_empty", vec![empty.clone(), empty.clone()], vec![]),
+    ] {
+        let target = temp.path().join(name);
+        Merger::new(&sources)
+            .merge(target.to_str().unwrap())
+            .await
+            .unwrap();
+        let reopened = Dataset::open(target.to_str().unwrap()).await.unwrap();
+        assert_eq!(reopened.count_rows(None).await.unwrap(), expected.len());
+        assert_eq!(values(&reopened).await, expected);
+        assert_eq!(reopened.schema(), data.schema());
+        assert!(!target.join("data").exists());
+    }
+}
+
+#[tokio::test]
+async fn merges_object_store_uris_without_filesystem_resolution() {
+    let session = Arc::new(lance::session::Session::default());
+    let mut sources = Vec::new();
+    for (uri, data) in [
+        ("memory://merge/empty", vec![]),
+        ("memory://merge/left", vec![Some(1), None]),
+        ("memory://merge/right", vec![Some(2)]),
+    ] {
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(data))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let source = Dataset::write(
+            reader,
+            uri,
+            Some(WriteParams {
+                session: Some(session.clone()),
+                enable_stable_row_ids: false,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        sources.push(source);
+    }
+    let merger = Merger::new(&sources);
+    let target = "memory://merge/output";
+    let merged = merger.merge(target).await.unwrap();
+    assert_eq!(values(&merged).await, vec![Some(1), None, Some(2)]);
+    assert!(
+        merged
+            .manifest
+            .base_paths
+            .values()
+            .all(|base| sources.iter().any(|source| base.path == source.uri()))
+    );
+    let reopened = lance::dataset::builder::DatasetBuilder::from_uri(target)
+        .with_session(session)
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(values(&reopened).await, vec![Some(1), None, Some(2)]);
+    let error = merger.merge(target).await.err().unwrap();
+    assert!(error.to_string().contains("Destination already exists"));
+    assert_eq!(reopened.version_id(), 1);
+    assert_eq!(reopened.count_versions().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn single_version_sources_receive_fresh_stable_row_ids() {
+    let temp = TempDir::new().unwrap();
+    let mut sources = Vec::new();
+    let paths = [temp.path().join("left"), temp.path().join("right")];
+    for (path, data) in paths.iter().zip([vec![1, 2], vec![3, 4]]) {
+        let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(data))]).unwrap();
+        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+        let source = Dataset::write(
+            reader,
+            path.to_str().unwrap(),
+            Some(WriteParams {
+                enable_stable_row_ids: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let batch = source.scan().with_row_id().try_into_batch().await.unwrap();
+        let ids = batch["_rowid"]
+            .as_any()
+            .downcast_ref::<arrow_array::UInt64Array>()
+            .unwrap();
+        assert_eq!(ids.values().as_ref(), &[0, 1]);
+        sources.push(source);
+    }
+    let before = paths.iter().map(|path| files(path)).collect::<Vec<_>>();
+    let target = temp.path().join("merged");
+    Merger::new(&sources)
+        .merge(target.to_str().unwrap())
+        .await
+        .unwrap();
+    let merged = Dataset::open(target.to_str().unwrap()).await.unwrap();
+    assert!(merged.manifest.uses_stable_row_ids());
+    assert_eq!(
+        values(&merged).await,
+        vec![Some(1), Some(2), Some(3), Some(4)]
+    );
+    let batch = merged
+        .scan()
+        .scan_in_order(true)
+        .with_row_id()
+        .try_into_batch()
+        .await
+        .unwrap();
+    let ids = batch["_rowid"]
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(ids.values().as_ref(), &[0, 1, 2, 3]);
+    assert!(!target.join("data").exists());
+    assert_eq!(
+        before,
+        paths.iter().map(|path| files(path)).collect::<Vec<_>>()
+    );
+}
