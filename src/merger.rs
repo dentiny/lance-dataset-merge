@@ -90,30 +90,7 @@ impl<'a> Merger<'a> {
             source
                 .schema()
                 .check_compatible(first.schema(), &comparison)?;
-            if source.version_id() != 1 || source.count_versions().await? != 1 {
-                return Err(Error::invalid_input(format!(
-                    "Source {} must have exactly one version (initial version 1)",
-                    source.uri()
-                )));
-            }
-            if source.schema().has_dictionary_types()
-                || source
-                    .schema()
-                    .fields_pre_order()
-                    .any(|field| field.is_blob())
-            {
-                return Err(Error::invalid_input(
-                    "Dictionary and blob columns are not supported",
-                ));
-            }
-            if source.load_indices().await?.iter().any(|index| {
-                index
-                    .index_details
-                    .as_ref()
-                    .is_some_and(|details| details.type_url.to_ascii_lowercase().contains("memwal"))
-            }) {
-                return Err(Error::invalid_input("MemWAL datasets are not supported"));
-            }
+            validate_source(source).await?;
             // Resolve inherited bases individually: their IDs are local to each source.
             let root = source.uri().to_owned();
             for fragment in manifest.fragments.iter() {
@@ -196,4 +173,32 @@ impl<'a> Merger<'a> {
             .execute(Transaction::new(0, operation, None))
             .await
     }
+}
+
+async fn validate_source(source: &Dataset) -> Result<()> {
+    if source.version_id() != 1 || source.count_versions().await? != 1 {
+        return Err(Error::invalid_input(format!(
+            "Source {} must have exactly one version (initial version 1)",
+            source.uri()
+        )));
+    }
+    if source.schema().has_dictionary_types()
+        || source
+            .schema()
+            .fields_pre_order()
+            .any(|field| field.is_blob())
+    {
+        return Err(Error::invalid_input(
+            "Dictionary and blob columns are not supported",
+        ));
+    }
+    if source.load_indices().await?.iter().any(|index| {
+        index
+            .index_details
+            .as_ref()
+            .is_some_and(|details| details.type_url.to_ascii_lowercase().contains("memwal"))
+    }) {
+        return Err(Error::invalid_input("MemWAL datasets are not supported"));
+    }
+    Ok(())
 }
