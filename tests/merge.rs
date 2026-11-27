@@ -5,7 +5,7 @@ use std::sync::Arc;
 use arrow_array::{Int32Array, RecordBatch, RecordBatchIterator};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
-use lance::dataset::WriteParams;
+use lance::dataset::{WriteMode, WriteParams};
 use lance_dataset_merge::Merger;
 use more_asserts::assert_gt;
 use tempfile::TempDir;
@@ -252,4 +252,67 @@ async fn single_version_sources_receive_fresh_stable_row_ids() {
         before,
         paths.iter().map(|path| files(path)).collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn schema_mismatch_including_an_empty_source_writes_nothing() {
+    let temp = TempDir::new().unwrap();
+    let source = write(&temp.path().join("source"), vec![Some(1)]).await;
+    let other_schema = Arc::new(Schema::new(vec![Field::new(
+        "different",
+        DataType::Int32,
+        true,
+    )]));
+    let empty_reader = RecordBatchIterator::new(
+        Vec::<Result<RecordBatch, arrow_schema::ArrowError>>::new(),
+        other_schema,
+    );
+    let other = Dataset::write(
+        empty_reader,
+        temp.path().join("other").to_str().unwrap(),
+        None,
+    )
+    .await
+    .unwrap();
+    let target = temp.path().join("merged");
+    let error = Merger::new(&[source, other])
+        .merge(target.to_str().unwrap())
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(error, lance_core::Error::SchemaMismatch { .. }));
+    assert!(!target.exists());
+}
+
+#[tokio::test]
+async fn rejects_old_and_latest_snapshots_of_multiversion_sources() {
+    let temp = TempDir::new().unwrap();
+    let source_path = temp.path().join("source");
+    let snapshot = write(&source_path, vec![Some(1)]).await;
+    let batch = RecordBatch::try_new(schema(), vec![Arc::new(Int32Array::from(vec![2]))]).unwrap();
+    let reader = RecordBatchIterator::new(vec![Ok(batch)], schema());
+    let latest = Dataset::write(
+        reader,
+        source_path.to_str().unwrap(),
+        Some(WriteParams {
+            mode: WriteMode::Append,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_gt!(latest.version_id(), snapshot.version_id());
+    let before = files(&source_path);
+    for (name, source) in [("old", snapshot), ("latest", latest)] {
+        let target = temp.path().join(name);
+        let error = Merger::new(&[source])
+            .merge(target.to_str().unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, lance_core::Error::InvalidInput { .. }));
+        assert!(error.to_string().contains("exactly one version"));
+        assert!(!target.exists());
+    }
+    assert_eq!(before, files(&source_path));
 }
